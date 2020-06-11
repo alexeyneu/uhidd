@@ -1,5 +1,6 @@
-/*-
+  /*-
  * Copyright (c) 2009 Kai Wang
+ * Copyright (c) 2020 Alex Neudatchin
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -33,16 +34,20 @@ __FBSDID("$FreeBSD: trunk/uvhid/uvhid.c 36 2009-07-29 02:59:57Z kaiw27 $");
 #include <sys/condvar.h>
 #include <sys/fcntl.h>
 #include <sys/kernel.h>
+#include <sys/conf.h>
 #include <sys/module.h>
 #include <sys/malloc.h>
 #include <sys/poll.h>
+#include <sys/thread.h>
 #include <sys/systm.h>
 #include <sys/taskqueue.h>
 #include <sys/uio.h>
 #include <sys/queue.h>
-#include <sys/selinfo.h>
-#include <dev/usb/usb_ioctl.h>
+#include <bus/u4b/usb_ioctl.h>
+#include <sys/device.h>
+#include <sys/devfs.h>
 #include "uvhid_var.h"
+#include <sys/lock.h>
 
 #define	UVHID_NAME	"uvhid"
 #define	UVHIDCTL_NAME	"uvhidctl"
@@ -55,11 +60,13 @@ MALLOC_DEFINE(M_UVHID, UVHID_NAME, "Virtual USB HID device");
 
 #define UVHID_LOCK_GLOBAL()	mtx_lock(&uvhidmtx);
 #define UVHID_UNLOCK_GLOBAL()	mtx_unlock(&uvhidmtx);
-#define UVHID_LOCK(s)		mtx_lock(&(s)->us_mtx)
-#define UVHID_UNLOCK(s)		mtx_unlock(&(s)->us_mtx)
+//#define UVHID_LO K(s)		mtx_lock(&(s)->us_mtx)
+//#define UVHID_UNL OCK(s)		mtx_unlock(&(s)->us_mtx)
 #define UVHID_LOCK_ASSERT(s, w)	mtx_assert(&(s)->us_mtx, w)
 #define	UVHID_SLEEP(s, f, d, t) \
 	msleep(&(s)->f, &(s)->us_mtx, PCATCH | (PZERO + 1), d, t)
+
+DEVFS_DEFINE_CLONE_BITMAP(uvhidctl);
 
 struct rqueue {
 	int		cc;
@@ -67,13 +74,14 @@ struct rqueue {
 	unsigned char	*head;
 	unsigned char	*tail;
 };
+struct lock lockn;
 
 struct uvhid_softc {
 	struct rqueue	us_rq;
 	struct rqueue	us_wq;
-	struct selinfo	us_rsel;
-	struct selinfo	us_wsel;
-	struct mtx	us_mtx;
+	struct kqinfo	us_rsel;
+	struct kqinfo	us_wsel;
+	struct lock	us_lock;
 	struct cv	us_cv;
 	
 	int		us_hcflags;
@@ -91,225 +99,189 @@ struct uvhid_softc {
 };
 
 /* Global mutex to protect the softc list. */
-static struct mtx uvhidmtx;
 static STAILQ_HEAD(, uvhid_softc) hidhead = STAILQ_HEAD_INITIALIZER(hidhead);
-static struct clonedevs	*hidctl_clones = NULL;
-static struct clonedevs	*hid_clones = NULL;
 
-static void	hidctl_clone(void *arg, struct ucred *cred, char *name,
-		    int namelen, struct cdev **dev);
-static void	hidctl_init(struct cdev *hidctl_dev, struct cdev *hid_dev);
+
 static int	gen_read(struct uvhid_softc *sc, int *scflag,
 		    struct rqueue *rq, struct uio *uio, int flag);
 static int	gen_write(struct uvhid_softc *sc, int *scflag,
-		    struct rqueue *rq, struct selinfo *sel, struct uio *uio,
+		    struct rqueue *rq, struct kqinfo *sel, struct uio *uio,
 		    int flag);
-static int	gen_poll(struct uvhid_softc *sc, struct rqueue *rq,
-		    struct selinfo *sel, int events, struct thread *td);
 static void	rq_reset(struct rqueue *rq);
 static void	rq_dequeue(struct rqueue *rq, char *dst, int *size);
 static void	rq_enqueue(struct rqueue *rq, char *src, int size);
+
+static d_clone_t	hidctl_clone;
 
 static d_open_t		hidctl_open;
 static d_close_t	hidctl_close;
 static d_read_t		hidctl_read;
 static d_write_t	hidctl_write;
 static d_ioctl_t	hidctl_ioctl;
-static d_poll_t		hidctl_poll;
+static d_kqfilter_t hidctl_kqfilter;
+
+
 static d_open_t		hid_open;
 static d_close_t	hid_close;
 static d_read_t		hid_read;
 static d_write_t	hid_write;
 static d_ioctl_t	hid_ioctl;
-static d_poll_t		hid_poll;
+static d_kqfilter_t hid_kqfilter;
 
-static struct cdevsw hidctl_cdevsw = {
-	.d_version = D_VERSION,
-	.d_flags   = D_NEEDMINOR,
+static struct dev_ops hidctl_cdevsw = {
+	.head = {UVHIDCTL_NAME},
 	.d_open	   = hidctl_open,
 	.d_close   = hidctl_close,
 	.d_read	   = hidctl_read,
 	.d_write   = hidctl_write,
 	.d_ioctl   = hidctl_ioctl,
-	.d_poll	   = hidctl_poll,
-	.d_name	   = UVHIDCTL_NAME,
+	.d_kqfilter = hidctl_kqfilter,
 };
 
-static struct cdevsw hid_cdevsw = {
-	.d_version = D_VERSION,
-	.d_flags   = D_NEEDMINOR,
+static struct dev_ops hid_cdevsw = {
+	.head = {UVHID_NAME},
 	.d_open	   = hid_open,
 	.d_close   = hid_close,
 	.d_read	   = hid_read,
 	.d_write   = hid_write,
 	.d_ioctl   = hid_ioctl,
-	.d_poll	   = hid_poll,
-	.d_name	   = UVHID_NAME,
+	.d_kqfilter = hid_kqfilter,
 };
 
-static void
-hidctl_clone(void *arg, struct ucred *cred, char *name, int namelen,
-    struct cdev **dev)
+
+static int
+hidctl_clone(struct dev_clone_args *t)
 {
 	struct cdev *hid_dev;
 	int unit;
+	
+	unit = devfs_clone_bitmap_get(&DEVFS_CLONE_BITMAP(uvhidctl), 0);
 
-	if (*dev != NULL)
-		return;
-	if (strcmp(name, UVHIDCTL_NAME) == 0)
-		unit = -1;
-	else if (dev_stdclone(name, NULL, UVHIDCTL_NAME, &unit) != 1)
-		return;
+	t->a_dev = make_only_dev(&hidctl_cdevsw, unit, UID_ROOT, GID_WHEEL, 0600,
+				  UVHIDCTL_NAME "%d", unit);
+	reference_dev(t->a_dev);
+	
+	hid_dev = make_dev(&hid_cdevsw, unit, UID_ROOT, GID_WHEEL, 0700,
+				  UVHID_NAME "%d", unit);
+	reference_dev(hid_dev);
 
-	/*
-	 * Create hidctl device node.
-	 */
-	if (clone_create(&hidctl_clones, &hidctl_cdevsw, &unit, dev, 0)) {
-		*dev = make_dev(&hidctl_cdevsw, unit, UID_ROOT, GID_WHEEL,
-		    0600, UVHIDCTL_NAME "%d", unit);
-		if (*dev != NULL) {
-			dev_ref(*dev);
-			(*dev)->si_flags |= SI_CHEAPCLONE;
-		}
-	}
-
-	/*
-	 * Create hid device node.
-	 */
-	hid_dev = NULL;
-	if (clone_create(&hid_clones, &hid_cdevsw, &unit, dev, 0)) {
-		hid_dev = make_dev(&hid_cdevsw, unit, UID_ROOT, GID_WHEEL,
-		    0666, UVHID_NAME "%d", unit);
-		if (hid_dev != NULL) {
-			dev_ref(hid_dev);
-			hid_dev->si_flags |= SI_CHEAPCLONE;
-		}
-	}
-
-	if (hid_dev == NULL)
-		return;
-
-	hidctl_init(*dev, hid_dev);
-}
-
-static void
-hidctl_init(struct cdev *hidctl_dev, struct cdev *hid_dev)
-{
 	struct uvhid_softc *sc;
 
-	sc = malloc(sizeof(*sc), M_UVHID, M_WAITOK|M_ZERO);
-	mtx_init(&sc->us_mtx, "uvhidmtx", NULL, MTX_DEF | MTX_RECURSE);
+	sc = kmalloc(sizeof(*sc), M_UVHID, M_WAITOK|M_ZERO);
+	lockinit(&sc->us_lock, "uvhidctl lock", 0, LK_CANRECURSE);
 	cv_init(&sc->us_cv, "uvhidcv");
-	hidctl_dev->si_drv1 = sc;
+	t->a_dev->si_drv1 = sc;
 	hid_dev->si_drv1 = sc;
-	UVHID_LOCK_GLOBAL();
+	lockmgr(&lockn, LK_EXCLUSIVE);
 	STAILQ_INSERT_TAIL(&hidhead, sc, us_next);
-	UVHID_UNLOCK_GLOBAL();
+	lockmgr(&lockn, LK_RELEASE);
+
+	return 0;
 }
+
 static void
 hidctl_destroy(struct uvhid_softc *sc)
 {
 
-	UVHID_LOCK(sc);
 	if (((sc->us_hcflags & OPEN) != 0) || ((sc->us_hflags & OPEN) != 0))
-		cv_wait_unlock(&sc->us_cv, &sc->us_mtx);
-	else
-		UVHID_UNLOCK(sc);
-	mtx_destroy(&sc->us_mtx);
+	{
+		lockmgr(&sc->us_lock, LK_EXCLUSIVE|LK_CANRECURSE);
+		cv_wait(&sc->us_cv, &sc->us_lock);
+		lockmgr(&sc->us_lock, LK_RELEASE);
+	}
 	cv_destroy(&sc->us_cv);
-	free(sc, M_UVHID);
+	lockuninit(&sc->us_lock);	
+	kfree(sc, M_UVHID);
 }
 
 static int
-hidctl_open(struct cdev *dev, int flag, int mode, struct thread *td)
+hidctl_open(struct dev_open_args* t)
 {
-	struct uvhid_softc *sc = dev->si_drv1;
+	struct uvhid_softc *sc = t->a_head.a_dev->si_drv1;
 
-	UVHID_LOCK(sc);
+	lwkt_getpooltoken(sc);
 	if (sc->us_hcflags & OPEN) {
-		UVHID_UNLOCK(sc);
+		lwkt_relpooltoken(sc);
 		return (EBUSY);
 	}
 	sc->us_hcflags |= OPEN;
 	rq_reset(&sc->us_rq);
 	rq_reset(&sc->us_wq);
-	UVHID_UNLOCK(sc);
+	lwkt_relpooltoken(sc);
 
 	return (0);
 }
 
 static int
-hidctl_close(struct cdev *dev, int flag, int mode, struct thread *td)
+hidctl_close(struct dev_close_args* t)
 {
-	struct uvhid_softc *sc = dev->si_drv1;
-
-	UVHID_LOCK(sc);
+	struct uvhid_softc *sc = t->a_head.a_dev->si_drv1;
+	struct klist *klist = &sc->us_rsel.ki_note;
+	lwkt_getpooltoken(sc);
 	sc->us_hcflags &= ~OPEN;
 	rq_reset(&sc->us_rq);
 	rq_reset(&sc->us_wq);
-	selwakeuppri(&sc->us_rsel, PZERO + 1);
+	KNOTE(klist, 0);
 	if ((sc->us_hflags & OPEN) == 0)
 		cv_broadcast(&sc->us_cv);
-	UVHID_UNLOCK(sc);
+	lwkt_relpooltoken(sc);
 
 	return (0);
 }
 
 static int
-hidctl_read(struct cdev *dev, struct uio *uio, int flag)
+hidctl_read(struct dev_read_args* t)
 {
-	struct uvhid_softc *sc = dev->si_drv1;
+	struct uvhid_softc *sc = t->a_head.a_dev->si_drv1;
 
-	return (gen_read(sc, &sc->us_hcflags, &sc->us_wq, uio, flag));
+	return (gen_read(sc, &sc->us_hcflags, &sc->us_wq, t->a_uio, t->a_ioflag));
 }
 
 static int
-hidctl_write(struct cdev *dev, struct uio *uio, int flag)
+hidctl_write(struct dev_write_args* t)
 {
-	struct uvhid_softc *sc = dev->si_drv1;
-
-	return (gen_write(sc, &sc->us_hcflags, &sc->us_rq, &sc->us_rsel, uio,
-	    flag));
+	struct uvhid_softc *sc = t->a_head.a_dev->si_drv1;
+	return (gen_write(sc, &sc->us_hcflags, &sc->us_rq, &sc->us_rsel, t->a_uio,
+	    t->a_ioflag));
 }
 
 static int
-hidctl_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
-    struct thread *td)
+hidctl_ioctl(struct dev_ioctl_args* t)
 {
-	struct uvhid_softc *sc = dev->si_drv1;
+	struct uvhid_softc *sc = t->a_head.a_dev->si_drv1;
 	struct usb_gen_descriptor *ugd;
 	unsigned char *rdesc;
 	int err;
 
 	err = 0;
 
-	switch (cmd) {
+	switch ( t->a_cmd ) {
 	case USB_SET_REPORT_DESC:
 
-		ugd = (struct usb_gen_descriptor *)data;
+		ugd = (struct usb_gen_descriptor *)t->a_data;
 		if (ugd->ugd_actlen == 0)
 			break;
 		if (ugd->ugd_actlen > UVHID_MAX_REPORT_DESC_SIZE) {
 			err = ENXIO;
 			break;
 		}
-		rdesc = malloc(UVHID_MAX_REPORT_DESC_SIZE, M_UVHID, M_WAITOK);
+		rdesc = kmalloc(UVHID_MAX_REPORT_DESC_SIZE, M_UVHID, M_WAITOK);
 		err = copyin(ugd->ugd_data, rdesc, ugd->ugd_actlen);
 		if (err) {
-			free(rdesc, M_UVHID);
+			kfree(rdesc, M_UVHID);
 			break;
 		}
-		UVHID_LOCK(sc);
+		lwkt_getpooltoken(sc);
 		bcopy(rdesc, sc->us_rdesc, ugd->ugd_actlen);
 		sc->us_rsz = ugd->ugd_actlen;
-		UVHID_UNLOCK(sc);
-		free(rdesc, M_UVHID);
+		lwkt_relpooltoken(sc);
+		kfree(rdesc, M_UVHID);
 		break;
 
 	case USB_SET_REPORT_ID:
-		UVHID_LOCK(sc);
-		sc->us_rid = *(int *)data;
-		UVHID_UNLOCK(sc);
+		lwkt_getpooltoken(sc);
+		sc->us_rid = *(int *)t->a_data;
+		lwkt_relpooltoken(sc);
 		break;
 
 	default:
@@ -320,88 +292,165 @@ hidctl_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
 	return (err);
 }
 
-static int
-hidctl_poll(struct cdev *dev, int events, struct thread *td)
-{
-	struct uvhid_softc *sc = dev->si_drv1;
 
-	return (gen_poll(sc, &sc->us_wq, &sc->us_wsel, events, td));
+
+static void filt_hidctldetach(struct knote *kn);
+static int filt_hidctlread(struct knote *kn, long hint);
+static int filt_hidctlwrite(struct knote *kn, long hint);
+
+static struct filterops hidctlread_filtops =
+	{ FILTEROP_ISFD ,
+	  NULL, filt_hidctldetach, filt_hidctlread };
+
+static struct filterops hidctlwrite_filtops =
+	{ FILTEROP_ISFD ,
+	  NULL, filt_hidctldetach, filt_hidctlwrite };
+
+
+static int
+hidctl_kqfilter(struct dev_kqfilter_args *t)
+{
+	struct knote *kn = t->a_kn;
+	cdev_t dev = t->a_head.a_dev;
+	struct uvhid_softc *sc = dev->si_drv1;
+		
+	t->a_result = 0;
+	struct klist *klist = &sc->us_wsel.ki_note;
+
+	switch (kn->kn_filter) {
+	case EVFILT_READ:
+		kn->kn_fop = &hidctlread_filtops;
+		break;
+	case EVFILT_WRITE:
+		kn->kn_fop = &hidctlwrite_filtops;
+		break;
+	default:
+		t->a_result = EOPNOTSUPP;
+		return (0);
+	}
+	kn->kn_hook = (caddr_t)t->a_head.a_dev;	
+	knote_insert(klist, kn);
+	return (0);
+
+}
+
+static void
+filt_hidctldetach(struct knote *kn) 
+{
+	cdev_t dev = (cdev_t)kn->kn_hook;
+	struct uvhid_softc *sc = dev->si_drv1;
+	struct klist *klist = &sc->us_wsel.ki_note;
+
+	knote_remove(klist, kn);
+
 }
 
 static int
-hid_open(struct cdev *dev, int flag, int mode, struct thread *td)
+filt_hidctlread(struct knote *kn, long hint)
 {
+	cdev_t dev = (cdev_t)kn->kn_hook;
 	struct uvhid_softc *sc = dev->si_drv1;
 
-	UVHID_LOCK(sc);
+	if(kn->kn_sfflags & NOTE_OLDAPI)
+	{
+		lwkt_getpooltoken(sc);
+		if (sc->us_wq.cc > 0)
+		{
+			lwkt_relpooltoken(sc);
+			return 1;
+		}
+		else;
+//			....
+		lwkt_relpooltoken(sc);
+	}
+	return 0;
+}
+
+static int
+filt_hidctlwrite(struct knote *kn, long hint)
+{
+	if(kn->kn_sfflags & NOTE_OLDAPI)
+		return 1;
+	return 0;
+}
+
+static int
+hid_open(struct dev_open_args* t)
+{
+
+	struct uvhid_softc *sc = t->a_head.a_dev->si_drv1;
+	
+	lwkt_getpooltoken(sc);
 	if (sc->us_hflags & OPEN) {
-		UVHID_UNLOCK(sc);
+		lwkt_relpooltoken(sc);
 		return (EBUSY);
 	}
 	sc->us_hflags |= OPEN;
-	UVHID_UNLOCK(sc);
+	lwkt_relpooltoken(sc);
 
 	return (0);
 }
 
 static int
-hid_close(struct cdev *dev, int flag, int mode, struct thread *td)
+hid_close(struct dev_close_args* t)
 {
-	struct uvhid_softc *sc = dev->si_drv1;
+	
+	struct uvhid_softc *sc = t->a_head.a_dev->si_drv1;
+	struct klist *klist; 	
+	klist = &sc->us_wsel.ki_note;
 
-	UVHID_LOCK(sc);
+	lwkt_getpooltoken(sc);
 	sc->us_hflags &= ~OPEN;
-	selwakeuppri(&sc->us_wsel, PZERO + 1);
+	KNOTE(klist, 0);
 	if ((sc->us_hcflags & OPEN) == 0)
 		cv_broadcast(&sc->us_cv);
-	UVHID_UNLOCK(sc);
+	lwkt_relpooltoken(sc);
 
 	return (0);
 }
 
 static int
-hid_read(struct cdev *dev, struct uio *uio, int flag)
+hid_read(struct dev_read_args* t)
 {
-	struct uvhid_softc *sc = dev->si_drv1;
+	struct uvhid_softc *sc = t->a_head.a_dev->si_drv1;
 
-	return (gen_read(sc, &sc->us_hflags, &sc->us_rq, uio, flag));
+	return (gen_read(sc, &sc->us_hflags, &sc->us_rq, t->a_uio, t->a_ioflag));
 }
 
 static int
-hid_write(struct cdev *dev, struct uio *uio, int flag)
+hid_write(struct dev_write_args* t)
 {
-	struct uvhid_softc *sc = dev->si_drv1;
+	struct uvhid_softc *sc = t->a_head.a_dev->si_drv1;
 
-	return (gen_write(sc, &sc->us_hflags, &sc->us_wq, &sc->us_wsel, uio,
-	    flag));
+	return (gen_write(sc, &sc->us_hflags, &sc->us_wq, &sc->us_wsel, t->a_uio,
+	    t->a_ioflag));
 }
 
 static int
-hid_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
-    struct thread *td)
+hid_ioctl(struct dev_ioctl_args* t)
 {
-	struct uvhid_softc *sc = dev->si_drv1;
+	struct uvhid_softc *sc = t->a_head.a_dev->si_drv1;
 	struct usb_gen_descriptor *ugd;
 	unsigned char *rdesc;
 	int err;
 
 	err = 0;
 
-	switch (cmd) {
+	switch ( t->a_cmd ) {
 	case USB_GET_REPORT_DESC:
-		rdesc = malloc(UVHID_MAX_REPORT_DESC_SIZE, M_UVHID, M_WAITOK);
-		UVHID_LOCK(sc);
-		ugd = (struct usb_gen_descriptor *)data;
+		rdesc = kmalloc(UVHID_MAX_REPORT_DESC_SIZE, M_UVHID, M_WAITOK);
+		lwkt_getpooltoken(sc);
+		ugd = (struct usb_gen_descriptor *)t->a_data;
 		ugd->ugd_actlen = min(sc->us_rsz, ugd->ugd_maxlen);
 		if (ugd->ugd_data == NULL || ugd->ugd_actlen == 0) {
-			free(rdesc, M_UVHID);
-			UVHID_UNLOCK(sc);
+			kfree(rdesc, M_UVHID);
+			lwkt_relpooltoken(sc);
 			break;
 		}
 		bcopy(sc->us_rdesc, rdesc, ugd->ugd_actlen);
-		UVHID_UNLOCK(sc);
+		lwkt_relpooltoken(sc);
 		err = copyout(rdesc, ugd->ugd_data, ugd->ugd_actlen);
-		free(rdesc, M_UVHID);
+		kfree(rdesc, M_UVHID);
 		break;
 
 	case USB_SET_IMMED:
@@ -411,9 +460,9 @@ hid_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
 		break;
 			
 	case USB_GET_REPORT_ID:
-		UVHID_LOCK(sc);
-		*(int *)data = sc->us_rid;
-		UVHID_UNLOCK(sc);
+		lwkt_getpooltoken(sc);
+		*(int *)t->a_data = sc->us_rid;
+		lwkt_relpooltoken(sc);
 		break;
 
 	default:
@@ -424,24 +473,96 @@ hid_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
 	return (err);
 }
 
+
+
+static void filt_hiddetach(struct knote *kn);
+static int filt_hidread(struct knote *kn, long hint);
+static int filt_hidwrite(struct knote *kn, long hint);
+
+static struct filterops hidread_filtops =
+	{ FILTEROP_ISFD ,
+	  NULL, filt_hiddetach, filt_hidread };
+
+static struct filterops hidwrite_filtops =
+	{ FILTEROP_ISFD ,
+	  NULL, filt_hiddetach, filt_hidwrite };
+
+
 static int
-hid_poll(struct cdev *dev, int events, struct thread *td)
+hid_kqfilter(struct dev_kqfilter_args *t)
 {
+	struct knote *kn = t->a_kn;
+	t->a_result = 0;
+	struct uvhid_softc *sc = t->a_head.a_dev->si_drv1;
+	struct klist *klist = &sc->us_rsel.ki_note;		
+
+	switch (kn->kn_filter) {
+	case EVFILT_READ:
+		kn->kn_fop = &hidread_filtops;
+		break;
+	case EVFILT_WRITE:
+		kn->kn_fop = &hidwrite_filtops;
+		break;
+	default:
+		t->a_result = EOPNOTSUPP;
+		return (0);
+	}
+
+	kn->kn_hook = (caddr_t)t->a_head.a_dev;
+	knote_insert(klist, kn);
+	return (0);
+
+}
+
+static void
+filt_hiddetach(struct knote *kn) 
+{
+	cdev_t dev = (cdev_t)kn->kn_hook;
+	struct uvhid_softc *sc = dev->si_drv1;
+	struct klist *klist = &sc->us_rsel.ki_note;	
+	knote_remove(klist, kn);
+}
+
+static int
+filt_hidread(struct knote *kn, long hint)
+{
+	cdev_t dev = (cdev_t)kn->kn_hook;
 	struct uvhid_softc *sc = dev->si_drv1;
 
-	return (gen_poll(sc, &sc->us_rq, &sc->us_rsel, events, td));
+	if(kn->kn_sfflags & NOTE_OLDAPI)
+	{
+		lwkt_getpooltoken(sc);
+			if (sc->us_rq.cc > 0)
+			{
+				lwkt_relpooltoken(sc);
+				return 1;
+			}
+			else;
+//				....
+		lwkt_relpooltoken(sc);
+	}
+	return 0;
 }
+
+static int
+filt_hidwrite(struct knote *kn, long hint)
+{
+	if(kn->kn_sfflags & NOTE_OLDAPI)
+		return 1;
+	return 0;
+}
+
 
 static int
 gen_read(struct uvhid_softc *sc, int *scflag, struct rqueue *rq,
     struct uio *uio, int flag)
 {
 	unsigned char buf[UVHID_MAX_REPORT_SIZE];
-	int amnt, err, len;
+	int amnt,len, err = 0;
 
-	UVHID_LOCK(sc);
+	lwkt_getpooltoken(sc);
 	if (*scflag & READ) {
-		UVHID_UNLOCK(sc);
+		lwkt_relpooltoken(sc);
 		return (EALREADY);
 	}
 	*scflag |= READ;
@@ -451,17 +572,21 @@ gen_read(struct uvhid_softc *sc, int *scflag, struct rqueue *rq,
 read_again:
 	if (rq->cc > 0) {
 		rq_dequeue(rq, buf, &len);
-		UVHID_UNLOCK(sc);
+		lwkt_relpooltoken(sc);
 		amnt = min(uio->uio_resid, len);
 		err = uiomove(buf, amnt, uio);
-		UVHID_LOCK(sc);
-	} else {
+		lwkt_getpooltoken(sc);
+		} 
+	else {
 		if (flag & O_NONBLOCK) {
 			err = EWOULDBLOCK;
 			goto read_done;
 		}
-		err = msleep(&rq->cc, &sc->us_mtx, PCATCH | (PZERO + 1),
-		    "uvhidr", 0);
+
+		lockmgr(&sc->us_lock, LK_EXCLUSIVE|LK_CANRECURSE);
+		lksleep(&rq->cc,&sc->us_lock , PCATCH, "uvhidr", 0);
+		lockmgr(&sc->us_lock, LK_RELEASE);
+
 		if (err != 0)
 			goto read_done;
 		goto read_again;
@@ -469,70 +594,43 @@ read_again:
 
 read_done:
 	*scflag &= ~READ;
-	UVHID_UNLOCK(sc);
+	lwkt_relpooltoken(sc);
 
 	return (err);
 }
 
 static int
 gen_write(struct uvhid_softc *sc, int *scflag, struct rqueue *rq,
-    struct selinfo *sel, struct uio *uio, int flag)
+    struct kqinfo *sel, struct uio *uio, int flag)
 {
 	unsigned char buf[UVHID_MAX_REPORT_SIZE];
 	int err, len;
-
-	UVHID_LOCK(sc);
+	struct klist *klist = &sel->ki_note;
+	lwkt_getpooltoken(sc);
 
 	if (*scflag & WRITE) {
-		UVHID_UNLOCK(sc);
+		lwkt_relpooltoken(sc);
 		return (EALREADY);
 	}
 	*scflag |= WRITE;
 
-	UVHID_UNLOCK(sc);
+	lwkt_relpooltoken(sc);
 	len = uio->uio_resid;
 	err = uiomove(buf, len, uio);
-	UVHID_LOCK(sc);
+	lwkt_getpooltoken(sc);
 	if (err != 0)
 		goto write_done;
 	rq_enqueue(rq, buf, len);
-	selwakeuppri(sel, PZERO + 1);
+	KNOTE(klist, 0);
 	wakeup(&rq->cc);
 
 write_done:
 	*scflag &= ~WRITE;
-	UVHID_UNLOCK(sc);
+	lwkt_relpooltoken(sc);
 
 	return (err);
 }
 
-static int
-gen_poll(struct uvhid_softc *sc, struct rqueue *rq, struct selinfo *sel,
-    int events, struct thread *td)
-{
-	int revents;
-
-	revents = 0;
-
-	UVHID_LOCK(sc);
-
-	if (events & (POLLIN | POLLRDNORM)) {
-		if (rq->cc > 0)
-			revents |= events & (POLLIN | POLLRDNORM);
-		else
-			selrecord(td, sel);
-	}
-
-	/*
-	 * Write is always non-blocking.
-	 */
-	if (events & (POLLOUT | POLLWRNORM))
-		revents |= events & (POLLOUT | POLLWRNORM);
-
-	UVHID_UNLOCK(sc);
-
-	return (revents);
-}
 
 static void
 rq_reset(struct rqueue *rq)
@@ -642,34 +740,30 @@ rq_enqueue(struct rqueue *rq, char *src, int size)
 static int
 uvhid_modevent(module_t mod, int type, void *data)
 {
-	static eventhandler_tag	tag;
 	struct uvhid_softc *sc;
+	static cdev_t devhc = NULL;
 
 	switch (type) {
 	case MOD_LOAD:
-		mtx_init(&uvhidmtx, "uvhidgmtx", NULL, MTX_DEF);
-		clone_setup(&hidctl_clones);
-		clone_setup(&hid_clones);
-		tag = EVENTHANDLER_REGISTER(dev_clone, hidctl_clone, 0, 1000);
-		if (tag == NULL) {
-			clone_cleanup(&hidctl_clones);
-			return (ENOMEM);
-		}
+		lockinit(&lockn, "uvhidctl lock", 0, 0);
+		devhc = make_autoclone_dev(&hidctl_cdevsw, &DEVFS_CLONE_BITMAP(uvhidctl),
+					hidctl_clone , UID_ROOT, GID_WHEEL,0600, UVHIDCTL_NAME);
 		break;
 
 	case MOD_UNLOAD:
-		EVENTHANDLER_DEREGISTER(dev_clone, tag);
-		UVHID_LOCK_GLOBAL();
+	case MOD_SHUTDOWN:
+		lockmgr(&lockn, LK_EXCLUSIVE);
 		while ((sc = STAILQ_FIRST(&hidhead)) != NULL) {
 			STAILQ_REMOVE(&hidhead, sc, uvhid_softc, us_next);
-			UVHID_UNLOCK_GLOBAL();
+			lockmgr(&lockn, LK_RELEASE);
 			hidctl_destroy(sc);
-			UVHID_LOCK_GLOBAL();
+			lockmgr(&lockn, LK_EXCLUSIVE);
 		}
-		UVHID_UNLOCK_GLOBAL();
-		clone_cleanup(&hidctl_clones);
-		clone_cleanup(&hid_clones);
-		mtx_destroy(&uvhidmtx);
+		lockmgr(&lockn, LK_RELEASE);
+		dev_ops_remove_all(&hidctl_cdevsw);
+		dev_ops_remove_all(&hid_cdevsw);
+		destroy_autoclone_dev(devhc, &DEVFS_CLONE_BITMAP(uvhidctl));
+		lockuninit(&lockn);
 		break;
 
 	default:
